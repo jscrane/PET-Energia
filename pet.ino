@@ -1,8 +1,7 @@
 #include <SPI.h>
 #include <SpiRAM.h>
-#include <FS.h>
-#include <SPIFFS.h>
 #include <UTFT.h>
+#include <SD.h>
 #include <r65emu.h>
 #include <r6502.h>
 

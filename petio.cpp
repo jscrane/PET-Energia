@@ -75,11 +75,11 @@ void petio::reset() {
 	timer_create(TICK_FREQ, petio::on_tick);
 }
 
-void IRAM_ATTR petio::on_tick() {
+void petio::on_tick() {
 	io->tick();
 }
 
-void IRAM_ATTR petio::tick() {
+void petio::tick() {
 	if (_ticks++ == SYS_TICKS) {
 		_ticks = 0;
 		_portb |= VIA_VIDEO_RETRACE;

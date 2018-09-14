@@ -1,7 +1,5 @@
-BOARD := node32s
-UPLOAD_SPEED := 921600
-TERM_SPEED := 115200
-SPIFFS_DIR := programs
+PROCESSOR_FAMILY := lm4f
+BOARD := lplm4f120h5qr
 CPPFLAGS = -DCPU_DEBUG
 
-include arduino-esp32.mk
+include energia10.mk
