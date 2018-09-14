@@ -3,6 +3,8 @@
 #include <keyboard.h>
 #include <sdtape.h>
 #include <timed.h>
+#include <sound_pwm.h>
+#include <hardware.h>
 
 #include "port.h"
 #include "kbd.h"
@@ -35,20 +37,6 @@
 #define IFR	0x0d
 #define IER	0x0e
 
-static petio *io;
-
-// 1ms internal clock tick
-#define TICK_FREQ	1000
-
-// 50Hz system interrupt frequency
-#define SYS_TICKS	20
-
-void petio::reset() {
-	keyboard.reset();
-
-	timer_create(TICK_FREQ, this);
-}
-
 #define IER_MASTER	0x80
 #define IER_TIMER1	0x40
 #define IER_TIMER2	0x20
@@ -58,25 +46,68 @@ void petio::reset() {
 #define IER_CA1_ACTIVE	0x02
 #define IER_CA2_ACTIVE	0x01
 
-bool petio::tick() {
+#define VIA_VIDEO_RETRACE	0x20
+#define VIA_ACR_SHIFT_MASK	0x1c
+#define VIA_ACR_T1_CONTINUOUS	0x40
+
+static petio *io;
+
+// 1ms internal clock tick
+#define TICK_FREQ	1000
+
+// 50Hz system interrupt frequency
+#define SYS_TICKS	20
+
+static PWM pwm;
+
+void petio::reset() {
+	io = this;
+
+	_acr = _ifr = _ier = 0x00;
+	_t1 = _t2 = 0;
+	_timer1 = _timer2 = false;
+
+	keyboard.reset();
+#if defined(PWM_SOUND)
+	pwm.begin(PWM_SOUND);
+#endif
+
+	timer_create(TICK_FREQ, petio::on_tick);
+}
+
+void IRAM_ATTR petio::on_tick() {
+	io->tick();
+}
+
+void IRAM_ATTR petio::tick() {
 	if (_ticks++ == SYS_TICKS) {
 		_ticks = 0;
-		_portb |= 0x20;
+		_portb |= VIA_VIDEO_RETRACE;
 		_irq.write(true);
+	} else
+		_portb &= ~VIA_VIDEO_RETRACE;
+
+	if (_timer1) {
+		if (_t1 < TICK_FREQ) {
+			_t1 = 0;
+			_timer1 = false;
+			_ifr |= IER_TIMER1;
+			if ((_ier & IER_MASTER) && (_ier & IER_TIMER1))
+				_irq.write(true);
+		} else
+			_t1 -= TICK_FREQ;
 	}
 
 	if (_timer2) {
-		if (_t2 < 1000) {
+		if (_t2 < TICK_FREQ) {
 			_t2 = 0;
 			_timer2 = false;
 			_ifr |= IER_TIMER2;
 			if ((_ier & IER_MASTER) && (_ier & IER_TIMER2))
 				_irq.write(true);
 		} else
-			_t2 -= 1000;
+			_t2 -= TICK_FREQ;
 	}
-	// FIXME: timer1
-	return true;
 }
 
 static void print(const char *msg, Memory::address a)
@@ -121,28 +152,39 @@ uint8_t petio::read() {
 	case VIA + VPORTA:
 		// ~DAV + ~NRFD + ~NDAC
 		r = _porta;
+		_ifr &= ~(IER_CA1_ACTIVE | IER_CA2_ACTIVE);
 		break;
 
 	case VIA + VPORTB:
 		// screen retrace in
-		//r = ((0xff - 0x20) & ~_ddrb);
+		r = _portb;
+		_ifr &= ~(IER_CB1_ACTIVE | IER_CB2_ACTIVE);
+		break;
+
+	case VIA + SHIFT:
+		print(" shift ", _acc);
+		_ifr &= ~IER_SHIFT_REG;
 		break;
 
 	case VIA + ACR:
 		print(" acr ", _acc);
 		// acr bits 5-7 relate to timers
+		r = _acr;
+		break;
+
+	case VIA + IER:
+		print(" ifr ", _acc);
+		r = _ier | 0x80;
 		break;
 
 	case VIA + IFR:
 		print(" ifr ", _acc);
-		// timer #1
-//		r = 0x40;
 		r = _ifr;
-		_ifr = 0;
 		break;
 
 	case VIA + T1LO:
 		r = (_t1 & 0xff);
+		_ifr &= ~IER_TIMER1;
 		break;
 
 	case VIA + T1HI:
@@ -159,6 +201,7 @@ uint8_t petio::read() {
 
 	case VIA + T2LO:
 		r = (_t2 & 0xff);
+		_ifr &= ~IER_TIMER2;
 		break;
 
 	case VIA + T2HI:
@@ -195,10 +238,12 @@ if (VIA < _acc && _acc <= VIA + 0x0f)
 
 	case VIA + VPORTB:
 		_portb = (r & _ddrb);
+		_ifr &= ~(IER_CB1_ACTIVE | IER_CB2_ACTIVE);
 		break;
 
 	case VIA + VPORTA:
 		_porta = (r & _ddra);
+		_ifr &= ~(IER_CA1_ACTIVE | IER_CA2_ACTIVE);
 		break;
 
 	case VIA + DDRB:
@@ -209,39 +254,60 @@ if (VIA < _acc && _acc <= VIA + 0x0f)
 		_ddra = r;
 		break;
 
+	case VIA + SHIFT:
+		print(" shift ", _acc, r);
+		sound_octave(r);
+		_ifr &= ~IER_SHIFT_REG;
+		break;
+
 	case VIA + ACR:
 		print(" acr ", _acc, r);
+		_acr = r;
+		if ((r & VIA_ACR_SHIFT_MASK) == 0x10)
+			sound_on();
+		else if (!(r & VIA_ACR_SHIFT_MASK))
+			sound_off();
+		if (r & VIA_ACR_T1_CONTINUOUS)
+			_timer1 = true;
 		break;
 
 	case VIA + IER:
-		_ier = r;
+		if (r & 0x80)
+			_ier |= r & 0x7f;
+		else
+			_ier &= ~(r & 0x7f);
+		break;
+
+	case VIA + IFR:
+		_ifr &= ~r;
 		break;
 
 	case VIA + T1LO:
-		_t1 = r;
-		_timer1 = false;
-		break;
-
-	case VIA + T1HI:
-		_t1 = (r * 256) + _t1;
-		_timer1 = true;
-		break;
-
 	case VIA + T1LLO:
-		_t1_latch = r;
+		_t1_latch = (_t1_latch & 0xff00) | r;
 		break;
 
 	case VIA + T1LHI:
-		_t1_latch = (r * 256) + _t1_latch;
+		_t1_latch = (_t1_latch & 0x00ff) | (r << 8);
+		_ifr &= ~IER_TIMER1;
+		break;
+
+	case VIA + T1HI:
+		_t1 = _t1_latch;
+		_ifr &= ~IER_TIMER1;
+		_timer1 = true;
 		break;
 
 	case VIA + T2LO:
 		_t2 = r;
 		_timer2 = false;
+		_ifr &= ~IER_TIMER2;
+		sound_freq(r);
 		break;
 
 	case VIA + T2HI:
-		_t2 = (r * 256) + _t2;
+		_t2 += (r << 8);
+		_ifr &= ~IER_TIMER2;
 		_timer2 = true;
 		break;
 
@@ -249,4 +315,23 @@ if (VIA < _acc && _acc <= VIA + 0x0f)
 		print(" >??? ", _acc, r);
 		break;
 	}
+}
+
+void petio::sound_on() {
+#if defined(PWM_DUTY)
+	pwm.set_duty(PWM_DUTY);
+#endif
+}
+
+void petio::sound_off() {
+	pwm.stop();
+}
+
+void petio::sound_freq(uint8_t p) {
+	unsigned f = 1000000 / (16*p + 30);
+	if (_octave == 15)
+		f /= 2;
+	else if (_octave == 85)
+		f *= 2;
+	pwm.set_freq(f);
 }

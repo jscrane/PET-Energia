@@ -1,7 +1,8 @@
 #include <SPI.h>
 #include <SpiRAM.h>
+#include <FS.h>
+#include <SPIFFS.h>
 #include <UTFT.h>
-#include <SD.h>
 #include <r65emu.h>
 #include <r6502.h>
 
@@ -54,20 +55,24 @@ void reset() {
 
 	io.reset();
 	disp.begin();
-	if (sd)
-		io.tape.start(PROGRAMS);
-	else
+	if (!sd)
 		disp.status("No SD Card");
+	else if (!io.tape.start(PROGRAMS))
+		disp.status("Failed to open "PROGRAMS);
 }
 
 void setup() {
+#if defined(DEBUG) || defined(CPU_DEBUG)
 	Serial.begin(115200);
+#endif
 	hardware_init(cpu);
 
 	for (int i = 0; i < RAM_SIZE; i += 1024)
 		memory.put(pages[i / 1024], i);
 
+#if defined(SPIRAM_CS)
 	memory.put(sram, SPIRAM_BASE, SPIRAM_EXTENT);
+#endif
 	memory.put(disp, 0x8000);
 	memory.put(io, 0xe800);
 
@@ -83,6 +88,10 @@ void setup() {
 }
 
 void loop() {
+#if defined(CPU_DEBUG)
+	static bool cpu_debug;
+#endif
+
 	if (ps2.available()) {
 		unsigned scan = ps2.read2();
 		uint8_t key = scan & 0xff;
@@ -96,11 +105,11 @@ void loop() {
 				break;
 			case PS2_F2:
 				filename = io.tape.advance();
-				disp.status(filename);
+				disp.status(filename? filename: "No file");
 				break;
 			case PS2_F3:
 				filename = io.tape.rewind();
-				disp.status(filename);
+				disp.status(filename? filename: "No file");
 				break;
 			case PS2_F4:
 				if (io.load_prg())
@@ -116,13 +125,27 @@ void loop() {
 				if (filename)
 					restore(io.tape, PROGRAMS, filename);
 				break;
+#if defined(CPU_DEBUG)
+			case PS2_F10:
+				cpu_debug = !cpu_debug;
+				break;
+#endif
 			default:
 				io.keyboard.up(key);
 				break;
 			}
 		}
 	} else if (!cpu.halted()) {
+#if defined(CPU_DEBUG)
+		if (cpu_debug) {
+			char buf[256];
+			Serial.println(cpu.status(buf, sizeof(buf)));
+			cpu.run(1);
+		} else
+			cpu.run(CPU_INSTRUCTIONS);
+#else
 		cpu.run(CPU_INSTRUCTIONS);
+#endif
 		if (irq.read()) {
 			irq.write(false);
 			cpu.raise(0);
